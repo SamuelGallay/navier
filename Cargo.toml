@@ -1,0 +1,9 @@
+[package]
+name = "navier"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ocl = "0.19"
+ocl-vkfft = { path = "ocl-vkfft" }
+rand = "0.8.5"

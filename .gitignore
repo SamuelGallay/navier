@@ -1,0 +1,6 @@
+/target
+ocl-vkfft/target
+.direnv
+.envrc
+ocl-vkfft/a.out
+ocl-vkfft/foo.o
