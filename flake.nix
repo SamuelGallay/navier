@@ -9,9 +9,13 @@
           opencl-headers
           ocl-icd
           cargo
+          cargo-flamegraph
           clang
+          fontconfig
           gcc
+          gdb
           libclang
+          pkg-config
           rustc
           rustfmt
           rust-analyzer

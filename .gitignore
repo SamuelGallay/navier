@@ -4,3 +4,4 @@ ocl-vkfft/target
 .envrc
 ocl-vkfft/a.out
 ocl-vkfft/foo.o
+plot

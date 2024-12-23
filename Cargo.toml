@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.95"
+ndarray = "0.16.1"
+num = "0.4.3"
 ocl = "0.19"
 ocl-vkfft = { path = "ocl-vkfft" }
+plotters = "0.3.7"
 rand = "0.8.5"
+
+[dev-dependencies]
