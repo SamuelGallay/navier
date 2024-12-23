@@ -5,7 +5,10 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
-ndarray = "0.16.1"
+image = "0.25.5"
+ndarray = "0.14.0"
+ndarray-image = "0.3.0"
+ndarray-stats = "0.6.0"
 num = "0.4.3"
 ocl = "0.19"
 ocl-vkfft = { path = "ocl-vkfft" }

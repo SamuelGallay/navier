@@ -1,7 +1,10 @@
 use plotters::prelude::*;
 use std::f32::consts::PI;
-
-use anyhow::Result;
+use ocl::Buffer;
+use anyhow::{anyhow, Result};
+use num::complex::{Complex, Complex32};
+use ndarray::Array2;
+use num::integer::Roots;
 
 pub fn plot<'a, I>(data: I, name: &str) -> Result<()>
 where
@@ -17,7 +20,7 @@ where
         .margin(5)
         .x_label_area_size(30)
         .y_label_area_size(30)
-        .build_cartesian_2d(0f32..l, -1f32..1f32)?;
+        .build_cartesian_2d(0f32..l, -2f32..2f32)?;
 
     chart.configure_mesh().draw()?;
 
@@ -59,3 +62,25 @@ pub fn fftfreq(n: usize, l: f32) -> Vec<f32> {
     }
     return freq;
 }
+
+pub fn get_from_gpu(buffer: &Buffer<Complex<f32>>) -> Result<Array2<Complex<f32>>> {
+    let n = buffer.len().sqrt();
+    let mut cpu_data = Array2::<Complex<f32>>::zeros((n, n));
+    buffer
+        .read(cpu_data.as_slice_mut().ok_or(anyhow!("Noo"))?)
+        .enq()?;
+    buffer.default_queue().unwrap().finish()?;
+    return Ok(cpu_data);
+}
+pub fn printmax(buffer: &Buffer<Complex<f32>>, name: &str) -> Result<()> {
+    let max = get_from_gpu(&buffer)?
+        .mapv(Complex32::norm)
+        .into_iter()
+        .cloned()
+        .reduce(f32::max)
+        .unwrap();
+    println!("Max {} : {}", name, max);
+    return Ok(());
+}
+
+
