@@ -1,5 +1,5 @@
-extern crate image;
 extern crate ndarray;
+extern crate nix;
 extern crate ocl;
 extern crate ocl_vkfft;
 extern crate rand;
@@ -7,146 +7,58 @@ extern crate rand;
 pub mod utils;
 
 use anyhow::{anyhow, Result};
-use core::time;
-use image::GrayImage;
-use ndarray::{s, Array2};
-use num::complex::{Complex, Complex32};
-use num::integer::Roots;
-use ocl::{ocl_core::ClDeviceIdPtr, Buffer, ProQue};
+use indicatif::ProgressBar;
+use num::complex::{Complex32, ComplexFloat};
+use ocl::ocl_core::ClDeviceIdPtr;
 use ocl_vkfft::{
     VkFFTApplication, VkFFTConfiguration, VkFFTLaunchParams, VkFFTResult_VKFFT_SUCCESS,
 };
-use rand::Rng;
 use std::f32::consts::PI;
-use std::thread::sleep;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::Instant;
-use utils::{get_from_gpu, plot, printmax};
+use std::time::SystemTime;
+use ndarray::Array2;
+use utils::new_buffer;
+//use std::thread;
+//use core::time;
 
-//use rand::Rng;
-const SRC: &str = r#"
-__kernel void add(__global float2* buffer, float scalar) {
-    buffer[get_global_id(0)].x += scalar;
-}
-        
-// diff in first coord, scalar is 2*pi/L
-__kernel void mdiff_x(__global float2* buffer_in, __global float2* buffer_out, int N, float scalar) {
-    int i = get_global_id(0);
-    int j = get_global_id(1);
-    float x = buffer_in[i*N +j].x;
-    float y = buffer_in[i*N +j].y;
-    float freq = scalar * ((float)i - (float)N * (2*i >= N));
-    buffer_out[i*N +j].x =  y * freq;
-    buffer_out[i*N +j].y = -x * freq;
-}
-__kernel void diff_y(__global float2* buffer_in, __global float2* buffer_out, int N, float scalar) {
-    int i = get_global_id(0);
-    int j = get_global_id(1);
-    float x = buffer_in[i*N +j].x;
-    float y = buffer_in[i*N +j].y;
-    float freq = scalar * ((float)j - (float)N * (2*j >= N));
-    buffer_out[i*N +j].x = -y * freq;
-    buffer_out[i*N +j].y =  x * freq;
-}
-__kernel void inv_mlap(__global float2* buffer_in, __global float2* buffer_out, int N, float scalar) {
-    int i = get_global_id(0);
-    int j = get_global_id(1);
-    float re = buffer_in[i*N +j].x;
-    float im = buffer_in[i*N +j].y;
-    float freqi = scalar * ((float)i - (float)N * (2*i >= N));
-    float freqj = scalar * ((float)j - (float)N * (2*j >= N));
-    float s = freqi*freqi + freqj*freqj + ((i==0) && (j==0));
-    buffer_out[i*N +j].x = re / s;
-    buffer_out[i*N +j].y = im / s;
-}
-__kernel void advection(__global float2* w_in, __global float2* w_out, __global float2* ux, __global float2* uy, int N, float L, float dt) {
-    int i = get_global_id(0);
-    int j = get_global_id(1);
-    float re = w_in[i*N +j].x;
-    float im = w_in[i*N +j].y;
-    
-    float ci = (float)i - dt*ux[i*N+j].x*(float)N/L;  
-    float cj = (float)j - dt*uy[i*N+j].x*(float)N/L;
-    int ei = (int) floor(ci);
-    int ej = (int) floor(cj);
-    float di = ci - (float)ei;
-    float dj = cj - (float)ej;
-
-    float s = 0;
-    s += (1-di)*(1-dj) * w_in[( ei    % N)*N +( ej    % N)].x;
-    s += (1-di)*   dj  * w_in[( ei    % N)*N +((ej+1) % N)].x;
-    s +=    di *(1-dj) * w_in[((ei+1) % N)*N +( ej    % N)].x;
-    s +=    di *   dj  * w_in[((ei+1) % N)*N +((ej+1) % N)].x;
-    
-    w_out[i*N +j].x = s;
-    w_out[i*N +j].y = 0;
-}
-"#;
-
-const N: usize = usize::pow(2, 10);
+const SRC: &str = include_str!("kernels.cl");
+const N: usize = usize::pow(2, 12);
 const L: f32 = 2.0 * PI;
 
-fn new_buffer(pro_que: &ProQue) -> Result<Buffer<Complex<f32>>> {
-    let buffer = Buffer::<Complex<f32>>::builder()
-        .queue(pro_que.queue().clone())
-        .len(N * N)
-        .build()?;
-    return Ok(buffer);
-}
-
-pub fn plot_from_gpu(buffer: &Buffer<Complex<f32>>, name: &str) -> Result<()> {
-    let cpu_data = get_from_gpu(&buffer)?;
-    let u8_vec = cpu_data
-        .map(|x| (128.0 * (x.re + 1.0)) as u8)
-        .into_raw_vec();
-    let a = GrayImage::from_raw(N as u32, N as u32, u8_vec).unwrap();
-    a.save(name)?;
-    return Ok(());
-}
-
 fn trivial() -> Result<()> {
-    let dx = L / N as f32;
-    let dt = 3f32;
-    let niter = 10;
-    //println!("freq : {:?}", utils::fftfreq(N, L));
-    let mut rng = rand::thread_rng();
-    let pro_que = ProQue::builder().src(SRC).build()?;
+    let _dx = L / N as f32;
+    let dt: f32 = 3f32;
+    let niter = 100;
 
-    let mut init_data = Array2::<Complex<f32>>::zeros((N, N)); // ![0f32; 2 * N];
-    for i in 0..N {
-        for j in 0..N {
-            init_data[[i, j]].re =
-                f32::cos(i as f32 * dx) * f32::sin(j as f32 * dx) + rng.gen::<f32>() * 0.01;
-        }
-    }
-    plot(
-        init_data.slice(s![.., 0]).iter().map(|x| &x.re),
-        "plot/in.svg",
-    )?;
-    let save_w = init_data
-        .map(|x| (128.0 * (x.re + 1.0)) as u8)
-        .into_raw_vec();
-    let a = GrayImage::from_raw(N as u32, N as u32, save_w).unwrap();
-    a.save("plot/in.png")?;
+    let platform = ocl::Platform::first()?;
+    let device = ocl::Device::first(&platform)?;
+    let context = ocl::Context::builder().build()?;
+    let program = ocl::Program::builder().src(SRC).build(&context)?;
+    let queue = ocl::Queue::new(&context, device, None)?;
+    let transfer_queue = ocl::Queue::new(&context, device, None)?;
 
-    //ndarray_image::save_gray_image("plot/test.jpg", save_w.view())?;
+    let init_data = utils::noise2d(N);
+    let mut w_back_data = Array2::<Complex32>::zeros((N, N));
 
-    let w_buffer = new_buffer(&pro_que)?;
-    let wnew_buffer = new_buffer(&pro_que)?;
-    let what_buffer = new_buffer(&pro_que)?;
-    let psihat_buffer = new_buffer(&pro_que)?;
-    let dxu_buffer = new_buffer(&pro_que)?;
-    let dyu_buffer = new_buffer(&pro_que)?;
+    let w_buffer = new_buffer(&queue, N)?;
+    let wnew_buffer = new_buffer(&queue, N)?;
+    let what_buffer = new_buffer(&queue, N)?;
+    let psihat_buffer = new_buffer(&queue, N)?;
+    let dxu_buffer = new_buffer(&queue, N)?;
+    let dyu_buffer = new_buffer(&queue, N)?;
     wnew_buffer
         .write(init_data.as_slice().ok_or(anyhow!("Oh no!"))?)
         .enq()?;
-    plot_from_gpu(&wnew_buffer, "plot/wnew.png")?;
+    utils::plot_from_gpu(&wnew_buffer, "plot/in.png")?;
 
     let config = VkFFTConfiguration {
         FFTdim: 2,
         size: [N as u64, N as u64, 0, 0],
         numberBatches: 1,
-        device: &mut pro_que.device().as_ptr(),
-        context: &mut pro_que.context().as_ptr(),
+        device: &mut device.as_ptr(),
+        context: &mut context.as_ptr(),
         bufferSize: &mut (8 * (N * N) as u64), // 8 = sizeof(Complex<f32>)
         normalize: 1,
         isInputFormatted: 1,
@@ -161,9 +73,9 @@ fn trivial() -> Result<()> {
     assert_eq!(res, VkFFTResult_VKFFT_SUCCESS);
 
     // ------------------------------------------------------------------------- //
-    let mut launch1 = VkFFTLaunchParams {
-        commandQueue: &mut pro_que.queue().as_ptr(),
-        inputBuffer: &mut wnew_buffer.as_ptr(),
+    let mut launch_what = VkFFTLaunchParams {
+        commandQueue: &mut queue.as_ptr(),
+        inputBuffer: &mut w_buffer.as_ptr(),
         buffer: &mut what_buffer.as_ptr(),
         ..Default::default()
     };
@@ -171,8 +83,10 @@ fn trivial() -> Result<()> {
     // Diffusion new_w -> what -> what -> w
 
     let kernel_invmlap = unsafe {
-        pro_que
-            .kernel_builder("inv_mlap")
+        ocl::Kernel::builder()
+            .program(&program)
+            .queue(queue.clone())
+            .name("inv_mlap")
             .global_work_size([N, N])
             .disable_arg_type_check()
             .arg(&what_buffer)
@@ -183,12 +97,14 @@ fn trivial() -> Result<()> {
     };
 
     let kernel_dxu = unsafe {
-        pro_que
-            .kernel_builder("diff_y")
+        ocl::Kernel::builder()
+            .program(&program)
+            .queue(queue.clone())
+            .name("diff_y")
             .global_work_size([N, N])
             .disable_arg_type_check()
             .arg(&psihat_buffer)
-            .arg(&psihat_buffer)
+            .arg(&dxu_buffer)
             //.arg(&dxu_buffer)
             .arg(N as i32)
             .arg(2.0 * PI / L)
@@ -196,8 +112,10 @@ fn trivial() -> Result<()> {
     };
 
     let kernel_dyu = unsafe {
-        pro_que
-            .kernel_builder("mdiff_x")
+        ocl::Kernel::builder()
+            .program(&program)
+            .queue(queue.clone())
+            .name("mdiff_x")
             .global_work_size([N, N])
             .disable_arg_type_check()
             .arg(&psihat_buffer)
@@ -206,23 +124,25 @@ fn trivial() -> Result<()> {
             .arg(2.0 * PI / L)
             .build()?
     };
-    let mut launch2 = VkFFTLaunchParams {
-        commandQueue: &mut pro_que.queue().as_ptr(),
+    let mut launch_dxu = VkFFTLaunchParams {
+        commandQueue: &mut queue.as_ptr(),
         inputBuffer: &mut dxu_buffer.as_ptr(),
         buffer: &mut dxu_buffer.as_ptr(),
         ..Default::default()
     };
 
-    let mut launch3 = VkFFTLaunchParams {
-        commandQueue: &mut pro_que.queue().as_ptr(),
+    let mut launch_dyu = VkFFTLaunchParams {
+        commandQueue: &mut queue.as_ptr(),
         inputBuffer: &mut dyu_buffer.as_ptr(),
         buffer: &mut dyu_buffer.as_ptr(),
         ..Default::default()
     };
 
     let kernel_advection = unsafe {
-        pro_que
-            .kernel_builder("advection")
+        ocl::Kernel::builder()
+            .program(&program)
+            .queue(queue.clone())
+            .name("advection")
             .global_work_size([N, N])
             .disable_arg_type_check()
             .arg(&w_buffer)
@@ -235,52 +155,99 @@ fn trivial() -> Result<()> {
             .build()?
     };
 
-    pro_que.queue().finish()?;
-    println!("Initialization complete. (fake)");
-
     // ------------------------------------------------------------------------- //
 
+    let sys_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs();
+
+    let mut ffmpeg = Command::new("ffmpeg")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "rgb24",
+            "-video_size",
+            &format!("{}x{}", N, N),
+            "-i",
+            "pipe:",
+            "-threads",
+            "2",
+            "-crf",
+            "19",
+            &format!("videos/{}.mp4", sys_time),
+        ])
+        .spawn()?;
+
+    let mut ffmpeg_in = ffmpeg.stdin.take().unwrap();
+
+    queue.finish()?;
+    println!("Initialization complete. (fake)");
+    let pb = ProgressBar::new(niter);
+
+    // ------------------------------------------------------------------------- //
     let instant = Instant::now();
     unsafe {
-        //for _i in 0..niter {
-        let res = ocl_vkfft::VkFFTAppend(&mut app, -1, &mut launch1);
-        assert_eq!(res, VkFFTResult_VKFFT_SUCCESS);
-        printmax(&what_buffer, "what")?;
-        wnew_buffer.copy(&w_buffer, None, None).enq()?;
-        kernel_invmlap.enq()?;
+        for _ in 0..niter {
+            wnew_buffer
+                .read(w_back_data.as_slice_mut().ok_or(anyhow!("Noo"))?)
+                .queue(&transfer_queue)
+                .enq()?;
+            wnew_buffer.copy(&w_buffer, None, None).enq()?;
 
-        printmax(&psihat_buffer, "psihat")?;
-        kernel_dxu.enq()?;
+            let res = ocl_vkfft::VkFFTAppend(&mut app, -1, &mut launch_what);
+            assert_eq!(res, VkFFTResult_VKFFT_SUCCESS);
 
-        psihat_buffer.copy(&dxu_buffer, None, None).enq()?;
+            kernel_invmlap.enq()?;
 
-        //kernel_dyu.enq()?;
+            kernel_dyu.enq()?;
+            let res = ocl_vkfft::VkFFTAppend(&mut app, 1, &mut launch_dyu);
+            assert_eq!(res, VkFFTResult_VKFFT_SUCCESS);
 
-        //let res = ocl_vkfft::VkFFTAppend(&mut app, 1, &mut launch2);
-        //assert_eq!(res, VkFFTResult_VKFFT_SUCCESS);
-        //let res = ocl_vkfft::VkFFTAppend(&mut app, 1, &mut launch3);
-        //assert_eq!(res, VkFFTResult_VKFFT_SUCCESS);
+            kernel_dxu.enq()?;
+            let res = ocl_vkfft::VkFFTAppend(&mut app, 1, &mut launch_dxu);
+            assert_eq!(res, VkFFTResult_VKFFT_SUCCESS);
 
-        kernel_advection.enq()?;
-        //}
+            transfer_queue.finish()?;
+            kernel_advection.enq()?;
+
+            let im = utils::image_from_array(&w_back_data.mapv(|x| x.re()))?;
+            ffmpeg_in.write_all(&im.to_vec())?;
+            queue.finish()?;
+            pb.inc(1);
+        }
     }
-    pro_que.queue().finish()?;
+    queue.finish()?;
     println!("Loop time: {:?}", instant.elapsed());
 
     // ------------------------------------------------------------------------- //
 
-    printmax(&wnew_buffer, "wnew")?;
+    ffmpeg_in.flush()?;
+    std::mem::drop(ffmpeg_in);
+    let ffmpeg_output = ffmpeg.wait_with_output().unwrap();
 
-    printmax(&wnew_buffer, "wnew")?;
+    match ffmpeg_output.status.code() {
+        Some(0) => println!(
+            "OK FFMPEG: {}",
+            String::from_utf8_lossy(&ffmpeg_output.stdout)
+        ),
+        Some(code) => println!("Error {}", code),
+        None => {}
+    }
 
-    //wnew_buffer.copy(&what_buffer, None, None).enq()?;
+    utils::plot_from_gpu(&wnew_buffer, "plot/out.png")?;
+    utils::plot_from_gpu(&dxu_buffer, "plot/dxu.png")?;
+    utils::plot_from_gpu(&dyu_buffer, "plot/dyu.png")?;
 
-    printmax(&what_buffer, "what")?;
-    printmax(&psihat_buffer, "psihat")?;
-    printmax(&dxu_buffer, "dxu")?;
-
-    plot_from_gpu(&wnew_buffer, "plot/end.png")?;
-    plot_from_gpu(&dxu_buffer, "plot/dxu.png")?;
+    utils::printmax(&w_buffer, "w")?;
+    utils::printmax(&wnew_buffer, "wnew")?;
+    utils::printmax(&dxu_buffer, "dxu")?;
+    utils::printmax(&dyu_buffer, "dyu")?;
 
     unsafe {
         ocl_vkfft::deleteVkFFT(&mut app);
@@ -291,9 +258,8 @@ fn trivial() -> Result<()> {
 }
 
 fn main() {
-    ocl_vkfft::say_hello();
     match trivial() {
-        Ok(_) => println!("Program exited successfully."),
+        Ok(()) => println!("Program exited successfully."),
         Err(e) => println!("Not working : {e:?}"),
     }
 }

@@ -12,6 +12,7 @@
           cargo-flamegraph
           clang
           fontconfig
+          ffmpeg
           gcc
           gdb
           libclang
